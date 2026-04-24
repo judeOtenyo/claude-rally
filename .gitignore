@@ -1,0 +1,32 @@
+# Local Claude Code session state — may contain granted permissions or secrets
+.claude/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Skill-creator eval workspace
+rally-skill-workspace/
+*-workspace/
+
+# Packaging output
+*.skill
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor cruft
+.idea/
+.vscode/
+*.swp
+*.swo

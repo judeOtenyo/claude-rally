@@ -17,8 +17,10 @@ conversation and save the answer via `config set`.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -48,8 +50,20 @@ COMMON_FIELDS = [
     "WorkProduct", "Requirement", "TestCase", "Tasks", "Defects", "Children",
     "Priority", "Severity", "Blocked", "BlockedReason", "Ready",
     "PlanEstimate", "TaskEstimateTotal", "TaskRemainingTotal", "Tags",
+    "Attachments",
     "CreationDate", "LastUpdateDate", "ObjectID", "_ref", "_refObjectName",
+    # Org-specific custom fields commonly used on defects. Rally silently
+    # ignores fields that don't exist on the artifact type, so listing these
+    # by default is harmless for stories/tasks.
+    "c_ActualResults", "c_ExpectedResults", "c_ReproSteps",
+    "c_SuccessCriteria", "c_Matrix",
 ]
+
+# Fields whose HTML often contains inline /slm/attachment/<oid>/... image refs
+HTML_FIELDS_WITH_IMAGES = (
+    "Description", "Notes",
+    "c_ActualResults", "c_ExpectedResults", "c_ReproSteps", "c_SuccessCriteria",
+)
 
 
 def die(code: str, message: str, **extra: Any) -> None:
@@ -179,12 +193,17 @@ def slim(obj: dict, fields: list[str] | None = None) -> dict:
         return obj
     fields = fields or COMMON_FIELDS
     out = {k: obj.get(k) for k in fields if k in obj}
+    # Always pass through any custom field (c_*) that came back, even if not
+    # in the explicit list — orgs vary in what custom fields they define.
+    for k, v in obj.items():
+        if k.startswith("c_") and k not in out:
+            out[k] = v
     for k in ("Owner", "Project", "Iteration", "Release", "Parent", "PortfolioItem", "WorkProduct",
               "Requirement", "DefaultProject"):
         v = out.get(k)
         if isinstance(v, dict):
             out[k] = _shrink_relation(v)
-    for k in ("Tasks", "Defects", "Children", "UserStories", "TestCase"):
+    for k in ("Tasks", "Defects", "Children", "UserStories", "TestCase", "Attachments"):
         v = out.get(k)
         if isinstance(v, dict):
             out[k] = _shrink_collection(v)
@@ -347,6 +366,138 @@ def cmd_tree(args: argparse.Namespace) -> None:
     print(json.dumps(expand(args.formatted_id.strip().upper(), args.depth), indent=2))
 
 
+def _safe_filename(name: str, oid: int | str | None) -> str:
+    """Make a filesystem-safe filename, prefixed with OID to avoid collisions."""
+    base = name or "attachment"
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._") or "attachment"
+    return f"{oid}_{base}" if oid else base
+
+
+def _download_via_attachmentcontent(cfg: dict, key: str, content_ref: str) -> bytes:
+    """Fetch /attachmentcontent/<oid>?fetch=Content and base64-decode the payload."""
+    url = content_ref + ("&" if "?" in content_ref else "?") + "fetch=Content"
+    data = http_get(url, key)
+    # Response shape: {"AttachmentContent": {"Content": "<base64>", ...}}
+    body = next((v for k, v in data.items() if k.lower() == "attachmentcontent"), None) or {}
+    blob = body.get("Content")
+    if not blob:
+        die("attachment_no_content", "AttachmentContent had no Content payload", ref=content_ref)
+    return base64.b64decode(blob)
+
+
+def _download_inline_image(cfg: dict, key: str, ref_path: str) -> bytes:
+    """Fetch a /slm/attachment/<oid>/<filename> URL directly (returns binary)."""
+    host = base_url(cfg).split("/slm/", 1)[0]
+    url = host + ref_path if ref_path.startswith("/") else ref_path
+    req = urllib.request.Request(url, headers={"zsessionid": key})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        die("inline_image_http_error", f"HTTP {e.code} fetching inline image", url=url)
+    except urllib.error.URLError as e:
+        die("inline_image_network_error", f"Network error: {e.reason}", url=url)
+    return b""
+
+
+def _extract_inline_image_refs(parent: dict) -> list[dict]:
+    """Pull /slm/attachment/<oid>/<filename> refs out of HTML body fields."""
+    pattern = re.compile(r'/slm/attachment/(\d+)/([^"\'<>\s]+)')
+    seen: set[str] = set()
+    refs: list[dict] = []
+    for field in HTML_FIELDS_WITH_IMAGES:
+        body = parent.get(field)
+        if not isinstance(body, str) or not body:
+            continue
+        for m in pattern.finditer(body):
+            oid, name = m.group(1), m.group(2)
+            ref_path = m.group(0)
+            if ref_path in seen:
+                continue
+            seen.add(ref_path)
+            refs.append({"ObjectID": int(oid), "Name": name, "Source": field, "RefPath": ref_path})
+    return refs
+
+
+def cmd_attachments(args: argparse.Namespace) -> None:
+    """List attachments on an artifact and optionally download them locally.
+
+    Covers two cases:
+      - Attachment objects in the parent's `Attachments` collection
+      - Inline images embedded in HTML body fields (Description, Notes,
+        c_ActualResults, etc.) — these reference /slm/attachment/<oid>/<file>
+    """
+    cfg = load_config()
+    key = require_key(cfg)
+    fid = args.formatted_id.strip().upper()
+    artifact = artifact_type_for_formatted_id(fid)
+    fetch_fields = ",".join(["FormattedID", "Name", "Attachments", *HTML_FIELDS_WITH_IMAGES])
+    url = query_url(cfg, artifact, query=f'(FormattedID = "{fid}")', fetch=fetch_fields, pagesize=2)
+    qr = unwrap_query(http_get(url, key))
+    results = qr.get("Results", [])
+    if not results:
+        die("not_found", f"No {artifact} with FormattedID '{fid}'")
+    parent = results[0]
+
+    items: list[dict] = []
+    attach_ref = (parent.get("Attachments") or {}).get("_ref") if isinstance(parent.get("Attachments"), dict) else None
+    if attach_ref and (parent.get("Attachments") or {}).get("Count", 0) > 0:
+        for att in fetch_collection(cfg, key, attach_ref):
+            items.append({
+                "Source": "Attachments",
+                "ObjectID": att.get("ObjectID"),
+                "Name": att.get("Name"),
+                "ContentType": att.get("ContentType"),
+                "Size": att.get("Size"),
+                "_content_ref": (att.get("Content") or {}).get("_ref"),
+            })
+
+    inline_refs = _extract_inline_image_refs(parent)
+    # Avoid duplicates: inline refs whose OID also appears in Attachments
+    attached_oids = {it["ObjectID"] for it in items if it.get("ObjectID")}
+    for ref in inline_refs:
+        if ref["ObjectID"] in attached_oids:
+            continue
+        items.append({
+            "Source": f"inline:{ref['Source']}",
+            "ObjectID": ref["ObjectID"],
+            "Name": ref["Name"],
+            "_inline_ref_path": ref["RefPath"],
+        })
+
+    download_dir: Path | None = None
+    if args.download and items:
+        download_dir = Path(args.dir) if args.dir else Path("/tmp/rally-attachments") / fid
+        download_dir.mkdir(parents=True, exist_ok=True)
+        for it in items:
+            try:
+                if it.get("_content_ref"):
+                    data = _download_via_attachmentcontent(cfg, key, it["_content_ref"])
+                elif it.get("_inline_ref_path"):
+                    data = _download_inline_image(cfg, key, it["_inline_ref_path"])
+                else:
+                    continue
+                fname = _safe_filename(it.get("Name"), it.get("ObjectID"))
+                path = download_dir / fname
+                path.write_bytes(data)
+                it["LocalPath"] = str(path)
+            except SystemExit:
+                # die() already printed structured error and called sys.exit; bubble up
+                raise
+
+    # Strip internal-only keys before output
+    for it in items:
+        it.pop("_content_ref", None)
+        it.pop("_inline_ref_path", None)
+
+    print(json.dumps({
+        "parent": {"FormattedID": fid, "Name": parent.get("Name")},
+        "download_dir": str(download_dir) if download_dir else None,
+        "count": len(items),
+        "attachments": items,
+    }, indent=2))
+
+
 def cmd_list(args: argparse.Namespace) -> None:
     cfg = load_config()
     key = require_key(cfg)
@@ -426,6 +577,13 @@ def build_parser() -> argparse.ArgumentParser:
     pt.add_argument("formatted_id")
     pt.add_argument("--depth", type=int, default=2)
     pt.set_defaults(func=cmd_tree)
+
+    pa = sub.add_parser("attachments", help="List/download attachments and inline images for an artifact")
+    pa.add_argument("formatted_id")
+    pa.add_argument("--download", action="store_true",
+                    help="Download all attachments + inline images to disk")
+    pa.add_argument("--dir", help="Download directory (default: /tmp/rally-attachments/<FID>/)")
+    pa.set_defaults(func=cmd_attachments)
 
     pl = sub.add_parser("list", help="Query artifacts with filters")
     pl.add_argument("--type", default="US", help="US|DE|TA|DS|TC|F (default US)")

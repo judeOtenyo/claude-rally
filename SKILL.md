@@ -63,6 +63,7 @@ All commands emit JSON on stdout. Errors emit `{"error": {"code": "...", "messag
 | `scripts/rally.py get <FID>` | Fetches one artifact (US/DE/TA/DS/TC/F/I/E); `--full` for all fields |
 | `scripts/rally.py children <FID>` | Immediate children — Tasks, Defects, Children, UserStories |
 | `scripts/rally.py tree <FID> [--depth N]` | Recursive children, default depth 2 |
+| `scripts/rally.py attachments <FID> [--download] [--dir PATH]` | List attachments + inline images; `--download` saves them to `/tmp/rally-attachments/<FID>/` |
 | `scripts/rally.py list --type US --project "Foo" --owner me --state In-Progress` | Query with filters |
 
 Artifact type prefixes: `US` user story, `DE` defect, `TA` task, `DS` defect suite, `TC` test case, `F`/`I`/`E` portfolio items (feature / initiative / epic). The script picks the right endpoint from the prefix.
@@ -77,6 +78,26 @@ The user's intent usually matches one of these patterns. Pick the one that fits,
 scripts/rally.py get DE1234
 ```
 Summarize the item for the user (one-line header + description preview + owner/state/iteration), then ask "ready to dig in?" before making any code changes. The Description field is often HTML — strip tags when you quote it back to the user.
+
+**For defects specifically — read the actual findings before anything else.** In most Rally tenants the `Description` field is empty and the real content lives in custom fields:
+
+- `c_ActualResults` — what the tester observed (the actual finding). **Read this first.** It's HTML and often contains inline `<img>` references to screenshots.
+- `c_ReproSteps` — how to reproduce. **This usually names the page, route, or screen where the defect appears** ("Go to /admin/events/new", "Open the Speakers tab", etc.). Grep the codebase for those paths/labels to locate the responsible component before you start guessing.
+- `c_ExpectedResults` — what should have happened instead. Frame the fix against this, not against your own interpretation.
+- `c_SuccessCriteria` — explicit acceptance criteria. If present, treat it as the definition of done.
+- `c_Matrix` — the test environment (browser, device, account role). Useful when the defect only repros in one configuration.
+
+These come back automatically with a normal `get DE####` — you don't need `--full`. If a tenant uses different custom field names, fall back to `get DE#### --full` to see everything that exists.
+
+### 1a. Defect screenshots — "show me what the tester saw"
+
+Defects almost always have screenshots, either as Attachment objects or embedded inline in `c_ActualResults`. Pull them down so you can actually look at them:
+
+```bash
+scripts/rally.py attachments DE1234 --download
+```
+
+This drops every attachment + inline image into `/tmp/rally-attachments/DE1234/` and returns the list of `LocalPath` values. Use the Read tool on each image to view it. The before/after comparison between the screenshot and your fix is often the fastest sanity check that you've actually addressed the problem.
 
 ### 2. Item + its children — "work through all the tasks in US500"
 
@@ -119,6 +140,12 @@ Once an item is loaded, the useful context to extract and reason from is:
 - `Owner` — sanity check it's the current user (or that the user explicitly wants to work someone else's queue)
 - `Iteration` / `Release` — useful for commit/PR context
 - `Blocked` / `BlockedReason` — if true, surface this before starting
+
+For defects, also weave in:
+- `c_ActualResults` — paraphrase the bug for context
+- `c_ReproSteps` — extract the page/route to know where to look in code
+- `c_ExpectedResults` — the target behaviour your fix must produce
+- Saved screenshots at `/tmp/rally-attachments/<FID>/*.png` — Read them; they often show details the text misses
 
 For commit messages, a reasonable default format is:
 

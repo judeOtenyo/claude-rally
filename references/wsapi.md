@@ -140,6 +140,20 @@ Rally doesn't publish hard rate limits but will slow or 503 under heavy load. Fo
 - Don't hammer `tree` with deep recursion on large portfolio items
 - If you get a 503, back off — don't retry tightly
 
+## Custom fields
+
+Rally lets each subscription define custom fields on any artifact type. They're stored under names prefixed with `c_`. The skill auto-fetches a common set used for defect details — `c_ActualResults`, `c_ExpectedResults`, `c_ReproSteps`, `c_SuccessCriteria`, `c_Matrix` — and `slim()` passes through any other `c_*` field that comes back. If your tenant uses different names, run `get DE#### --full` once to discover them, then add them to `COMMON_FIELDS` in the script (or just rely on the `c_*` pass-through).
+
+## Attachments and inline images
+
+Two distinct concepts that the skill treats as one:
+
+1. **Attachment objects** — entries in the artifact's `Attachments` collection. Each is a record with `Name`, `ContentType`, `Size`, and a `Content` ref pointing to a separate `AttachmentContent` object. To get the binary, GET the `AttachmentContent` ref with `?fetch=Content` and base64-decode the `Content` field.
+
+2. **Inline images** — when a user pastes a screenshot into a rich-text field, Rally stores an Attachment AND embeds an `<img src="/slm/attachment/<oid>/<filename>">` in the field's HTML. The same binary is fetchable directly via `https://<host>/slm/attachment/<oid>/<filename>` with the `zsessionid` header — no WSAPI wrapping. The skill's `attachments --download` command grabs both kinds, deduping by ObjectID.
+
+Saved files live under `/tmp/rally-attachments/<FormattedID>/<oid>_<filename>`. Filenames are prefixed with the OID to avoid collisions — Rally users tend to paste many screenshots that all default to `image.png`.
+
 ## Known quirks
 
 - `Description`/`Notes` are stored as HTML. They often contain pasted Word/Office markup that's messy. Strip tags and collapse whitespace before showing the user.

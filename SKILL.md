@@ -68,6 +68,14 @@ All commands emit JSON on stdout. Errors emit `{"error": {"code": "...", "messag
 
 Artifact type prefixes: `US` user story, `DE` defect, `TA` task, `DS` defect suite, `TC` test case, `F`/`I`/`E` portfolio items (feature / initiative / epic). The script picks the right endpoint from the prefix.
 
+### Closed items are hidden by default
+
+`list`, `children`, and `tree` filter out items in their terminal state — `Closed` for defects, `Accepted` for stories, `Completed` for tasks. The signal you're working from is "what still needs attention," and dragging finished work into that view is noise.
+
+Pass `--include-closed` only when the user explicitly asks for everything ("show me all defects in DS22 including the closed ones", "what did the team finish last sprint?"). Don't add the flag preemptively. If the user passes `--state` directly (e.g. `--state Accepted`), the default filter is skipped — they've told you what they want.
+
+`children` returns a `closed_filtered` count in the JSON; surface that to the user when it's non-zero so they know more is available behind `--include-closed`.
+
 ## Workflows
 
 The user's intent usually matches one of these patterns. Pick the one that fits, then execute.
@@ -98,6 +106,21 @@ scripts/rally.py attachments DE1234 --download
 ```
 
 This drops every attachment + inline image into `/tmp/rally-attachments/DE1234/` and returns the list of `LocalPath` values. Use the Read tool on each image to view it. The before/after comparison between the screenshot and your fix is often the fastest sanity check that you've actually addressed the problem.
+
+### 1b. Could this defect already be fixed? — "is this stale?"
+
+When the user asks whether a defect might already be resolved ("is DE1234 still valid?", "could this be outdated?", "do you think this got fixed in another PR?"), don't guess. Compare the defect's `CreationDate` against the git history of the affected code:
+
+1. Run `scripts/rally.py get DE####` and note `CreationDate`.
+2. Identify the affected file(s). The fastest path is usually `c_ReproSteps` — it almost always names the page, route, or screen the defect occurs on. Grep the codebase for that path/component name to land on the right file.
+3. Run `git log --since="<CreationDate>" -- <file...>` (or `--after=`). Look at what changed, when, and by whom.
+4. Reason about it for the user:
+   - **No commits since the defect was filed** → the responsible code hasn't moved; the defect is almost certainly still valid.
+   - **Commits exist after the filing date** → the affected area has been touched. Read the commits' diffs and messages. If they touch the specific behaviour the defect describes (the field, the error path, the component), the defect may already be fixed. Show the user the commit list and recommend they verify manually before closing the ticket — code being touched isn't proof the bug is gone.
+   - **The whole file/component was rewritten or removed** → flag this; the original repro may not even apply anymore.
+5. Present this as an approximation, not a verdict. The user closes Rally tickets, not you.
+
+This is a heuristic. It saves time when there's strong signal one way or the other, and it flags the ambiguous middle for a human eye.
 
 ### 2. Item + its children — "work through all the tasks in US500"
 

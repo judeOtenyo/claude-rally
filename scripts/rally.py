@@ -296,6 +296,46 @@ def cmd_get(args: argparse.Namespace) -> None:
     print(json.dumps(slim(results[0]) if not args.full else results[0], indent=2))
 
 
+# Terminal/done states by artifact type. Tenants can rename workflow states,
+# but these Rally builtins are the most common "this item is closed" signals.
+TERMINAL_STATE_FIELD = {
+    "defect": "State",
+    "defectsuite": "State",
+    "hierarchicalrequirement": "ScheduleState",
+    "task": "State",
+    "testcase": None,
+    "testset": None,
+}
+TERMINAL_STATE_VALUES = {
+    "defect": ("Closed",),
+    "defectsuite": ("Closed",),
+    "hierarchicalrequirement": ("Accepted",),
+    "task": ("Completed",),  # Rally tasks: Defined → In-Progress → Completed
+}
+
+
+def _is_closed(item: dict) -> bool:
+    """Best-effort closed check that works across artifact types in a mixed list."""
+    state = (item.get("State") or "").strip()
+    schedule_state = (item.get("ScheduleState") or "").strip()
+    return state == "Closed" or schedule_state == "Accepted" or state == "Completed"
+
+
+def _closed_exclusion_clause(artifact: str) -> str | None:
+    """Build a Rally query clause that excludes terminal states for an artifact type."""
+    field = TERMINAL_STATE_FIELD.get(artifact)
+    values = TERMINAL_STATE_VALUES.get(artifact, ())
+    if not field or not values:
+        return None
+    parts = [f'({field} != "{v}")' for v in values]
+    if len(parts) == 1:
+        return parts[0]
+    clause = parts[0]
+    for p in parts[1:]:
+        clause = f"({clause} AND {p})"
+    return clause
+
+
 def fetch_collection(cfg: dict, key: str, collection_ref: str, pagesize: int = DEFAULT_PAGESIZE) -> list:
     if "?" in collection_ref:
         url = f"{collection_ref}&fetch=true&pagesize={pagesize}"
@@ -325,13 +365,21 @@ def cmd_children(args: argparse.Namespace) -> None:
     parent = results[0]
 
     buckets: dict[str, list] = {}
+    closed_filtered = 0
     for rel in ("Tasks", "Defects", "Children", "UserStories"):
         ref = parent.get(rel)
         if isinstance(ref, dict) and ref.get("Count", 0) > 0 and ref.get("_ref"):
-            buckets[rel] = [slim(r) for r in fetch_collection(cfg, key, ref["_ref"])]
+            kids = [slim(r) for r in fetch_collection(cfg, key, ref["_ref"])]
+            if not args.include_closed:
+                before = len(kids)
+                kids = [k for k in kids if not _is_closed(k)]
+                closed_filtered += before - len(kids)
+            buckets[rel] = kids
     print(json.dumps({
         "parent": slim(parent),
         "children": buckets,
+        "closed_filtered": closed_filtered,
+        "include_closed": bool(args.include_closed),
     }, indent=2))
 
 
@@ -355,6 +403,8 @@ def cmd_tree(args: argparse.Namespace) -> None:
             ref = results[0].get(rel)
             if isinstance(ref, dict) and ref.get("Count", 0) > 0 and ref.get("_ref"):
                 kids = fetch_collection(cfg, key, ref["_ref"])
+                if not args.include_closed:
+                    kids = [k for k in kids if not _is_closed(k)]
                 children[rel] = [
                     expand(k["FormattedID"], depth - 1) if k.get("FormattedID") else slim(k)
                     for k in kids
@@ -525,6 +575,14 @@ def cmd_list(args: argparse.Namespace) -> None:
     if args.iteration:
         clauses.append(f'(Iteration.Name = "{args.iteration}")')
 
+    # Hide closed/accepted items unless the user explicitly opted in or
+    # already filtered by state. The skill-level rationale: most queries are
+    # "what's on my plate", and a queue full of accepted stories is noise.
+    if not args.include_closed and not args.state:
+        excl = _closed_exclusion_clause(artifact)
+        if excl:
+            clauses.append(excl)
+
     query = None
     if clauses:
         q = clauses[0]
@@ -571,11 +629,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     pch = sub.add_parser("children", help="Fetch immediate children (tasks/defects/sub-stories)")
     pch.add_argument("formatted_id")
+    pch.add_argument("--include-closed", action="store_true",
+                     help="Include closed/accepted/completed children (filtered out by default)")
     pch.set_defaults(func=cmd_children)
 
     pt = sub.add_parser("tree", help="Recursive children to a bounded depth")
     pt.add_argument("formatted_id")
     pt.add_argument("--depth", type=int, default=2)
+    pt.add_argument("--include-closed", action="store_true",
+                    help="Include closed/accepted/completed nodes (filtered out by default)")
     pt.set_defaults(func=cmd_tree)
 
     pa = sub.add_parser("attachments", help="List/download attachments and inline images for an artifact")
@@ -595,6 +657,8 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--order", default=None, help="e.g. 'LastUpdateDate DESC'")
     pl.add_argument("--pagesize", type=int, default=50)
     pl.add_argument("--start", type=int, default=1)
+    pl.add_argument("--include-closed", action="store_true",
+                    help="Include closed/accepted/completed items (filtered out by default)")
     pl.set_defaults(func=cmd_list)
 
     return p

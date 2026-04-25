@@ -48,6 +48,46 @@ Restart Claude Code (or start a new session) and the skill will be picked up aut
 
 Or, if you have the `skill-creator` tooling from Anthropic, use its `package_skill.py` to produce a signed bundle.
 
+## Updating
+
+The skill is just a git working tree, so updates are a `git pull` away. Your config in `~/.rally` (API key, default project, orchestration mode) lives outside the skill directory and survives updates — you won't need to re-auth.
+
+### If you cloned directly into `~/.claude/skills/rally`
+
+```bash
+cd ~/.claude/skills/rally
+git pull origin main
+```
+
+### If you cloned elsewhere and symlinked
+
+```bash
+cd ~/code/claude-rally   # wherever you actually cloned it
+git pull origin main
+```
+
+The symlink picks up the changes automatically — nothing to do on the `~/.claude/skills/rally` side.
+
+### If you uploaded a `.skill` bundle to Claude.ai
+
+Re-clone (or `git pull` your existing clone), re-zip, and re-upload — Claude.ai treats the new upload as a new version:
+
+```bash
+cd ~/code/claude-rally
+git pull origin main
+zip -r ../claude-rally.skill . -x '.git/*' '.claude/*'
+```
+
+### Checking what version you're on
+
+There aren't tagged releases yet, but you can always check the commit:
+
+```bash
+git -C ~/.claude/skills/rally log -1 --oneline
+```
+
+Restart Claude Code (or start a fresh session) after pulling so the updated `SKILL.md` description is reloaded.
+
 ## First-run configuration
 
 The first time Claude invokes the skill, it will run `whoami` to check your API key. If no key is found, Claude will ask you for one in the chat and save it to `~/.rally` (chmod 600) via the skill's config command.

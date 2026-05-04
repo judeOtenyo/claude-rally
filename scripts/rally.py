@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import colorsys
 import json
 import os
 import re
@@ -50,7 +51,7 @@ COMMON_FIELDS = [
     "WorkProduct", "Requirement", "TestCase", "Tasks", "Defects", "Children",
     "Priority", "Severity", "Blocked", "BlockedReason", "Ready",
     "PlanEstimate", "TaskEstimateTotal", "TaskRemainingTotal", "Tags",
-    "Attachments",
+    "Attachments", "Discussion", "DisplayColor",
     "CreationDate", "LastUpdateDate", "ObjectID", "_ref", "_refObjectName",
     # Org-specific custom fields commonly used on defects. Rally silently
     # ignores fields that don't exist on the artifact type, so listing these
@@ -64,6 +65,132 @@ HTML_FIELDS_WITH_IMAGES = (
     "Description", "Notes",
     "c_ActualResults", "c_ExpectedResults", "c_ReproSteps", "c_SuccessCriteria",
 )
+
+
+def color_family(hex_str: str | None) -> str | None:
+    """Bucket a hex color (e.g. '#6a1b9a') into a friendly family name.
+
+    Rally tag colors are stored as hex strings. Tenants pick from a palette
+    that varies slightly by version, so we map by HSV rather than matching
+    exact hex values — that way 'purple' catches both Rally's classic purple
+    and any custom variants the team may have configured.
+    """
+    if not hex_str:
+        return None
+    h = hex_str.lstrip("#").strip()
+    if len(h) != 6:
+        return None
+    try:
+        r, g, b = int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255
+    except ValueError:
+        return None
+    hue, s, v = colorsys.rgb_to_hsv(r, g, b)
+    hue_deg = hue * 360
+    if v < 0.15:
+        return "black"
+    if s < 0.10 and v > 0.85:
+        return "white"
+    if s < 0.18:
+        return "gray"
+    if hue_deg < 15 or hue_deg >= 345:
+        return "red"
+    if hue_deg < 45:
+        return "orange"
+    if hue_deg < 70:
+        return "yellow"
+    if hue_deg < 90:
+        return "lime"
+    if hue_deg < 160:
+        return "green"
+    if hue_deg < 200:
+        return "cyan"
+    if hue_deg < 220:
+        return "sky"
+    if hue_deg < 250:
+        return "blue"
+    if hue_deg < 300:
+        return "purple"
+    if hue_deg < 330:
+        return "magenta"
+    return "pink"
+
+
+def fetch_tag_index(cfg: dict, key: str) -> dict[int, dict]:
+    """Fetch every tag visible to the key, indexed by ObjectID.
+
+    Used to translate `--tag-color purple` into a set of tag refs we can use
+    in a Rally query, and to expand each artifact's tag refs back to names
+    + colors when filtering children client-side.
+    """
+    url = query_url(cfg, "tag", fetch="Name,Color,ObjectID,Archived",
+                    pagesize=2000, order="Name")
+    qr = unwrap_query(http_get(url, key))
+    out: dict[int, dict] = {}
+    for tag in qr.get("Results", []):
+        if tag.get("Archived"):
+            continue
+        oid = tag.get("ObjectID")
+        if not oid:
+            continue
+        color = tag.get("Color") or ""
+        out[oid] = {
+            "Name": tag.get("Name"),
+            "Color": color,
+            "ColorFamily": color_family(color),
+            "_ref": tag.get("_ref"),
+            "ObjectID": oid,
+        }
+    return out
+
+
+def resolve_tag_filter(tag_index: dict[int, dict],
+                       tag_name: str | None,
+                       tag_color: str | None) -> list[dict]:
+    """Pick the tags that match a --tag and/or --tag-color request.
+
+    --tag-color accepts either a friendly family name (purple, red, blue…)
+    or a 6-digit hex code with or without leading #.
+    """
+    candidates = list(tag_index.values())
+    if tag_name:
+        target = tag_name.lower()
+        candidates = [t for t in candidates if (t.get("Name") or "").lower() == target]
+    if tag_color:
+        raw = tag_color.strip()
+        if raw.startswith("#") or (len(raw) == 6 and all(c in "0123456789abcdefABCDEF" for c in raw)):
+            target_hex = raw.lower().lstrip("#")
+            candidates = [t for t in candidates if (t.get("Color") or "").lower().lstrip("#") == target_hex]
+        else:
+            target_family = raw.lower()
+            candidates = [t for t in candidates if (t.get("ColorFamily") or "") == target_family]
+    return candidates
+
+
+def _refs_or_clause(refs: list[str], field: str = "Tags") -> str | None:
+    """Build (FIELD = "ref1") OR (FIELD = "ref2") OR ... in Rally query syntax."""
+    if not refs:
+        return None
+    parts = [f'({field} = "{r}")' for r in refs]
+    if len(parts) == 1:
+        return parts[0]
+    clause = parts[0]
+    for p in parts[1:]:
+        clause = f"({clause} OR {p})"
+    return clause
+
+
+def artifact_tag_oids(artifact: dict) -> set[int]:
+    """Pull tag OIDs out of a raw artifact's Tags._tagsNameArray."""
+    tags = artifact.get("Tags")
+    if not isinstance(tags, dict):
+        return set()
+    out: set[int] = set()
+    for entry in tags.get("_tagsNameArray", []) or []:
+        ref = entry.get("_ref") or ""
+        m = re.search(r"/tag/(\d+)", ref)
+        if m:
+            out.add(int(m.group(1)))
+    return out
 
 
 def die(code: str, message: str, **extra: Any) -> None:
@@ -203,12 +330,19 @@ def slim(obj: dict, fields: list[str] | None = None) -> dict:
         v = out.get(k)
         if isinstance(v, dict):
             out[k] = _shrink_relation(v)
-    for k in ("Tasks", "Defects", "Children", "UserStories", "TestCase", "Attachments"):
+    for k in ("Tasks", "Defects", "Children", "UserStories", "TestCase", "Attachments", "Discussion"):
         v = out.get(k)
         if isinstance(v, dict):
             out[k] = _shrink_collection(v)
     if isinstance(out.get("Tags"), dict):
         out["Tags"] = _shrink_tags(out["Tags"])
+    # Derive a friendly color family from DisplayColor so Claude doesn't have
+    # to do hex math when summarising. Cheap and the user always finds it
+    # more readable than a raw #4a1d7e.
+    if isinstance(out.get("DisplayColor"), str) and out["DisplayColor"]:
+        fam = color_family(out["DisplayColor"])
+        if fam:
+            out["DisplayColorFamily"] = fam
     return out
 
 
@@ -282,6 +416,38 @@ def resolve_project_ref(cfg: dict, key: str, project_arg: str | None) -> str | N
     return results[0]["_ref"]
 
 
+def fetch_comments(cfg: dict, key: str, parent: dict) -> list[dict]:
+    """Expand the Discussion collection into a list of slimmed ConversationPosts.
+
+    Comments are where testers and devs talk — verification notes, blockers,
+    rejected fixes, prior context. Always cheap to fetch (one extra call) and
+    nearly always worth it for bug investigation.
+    """
+    disc = parent.get("Discussion")
+    if not isinstance(disc, dict):
+        return []
+    if disc.get("Count", 0) == 0 or not disc.get("_ref"):
+        return []
+    posts = fetch_collection(cfg, key, disc["_ref"])
+    out = []
+    for p in posts:
+        user = p.get("User") or {}
+        out.append({
+            "Text": p.get("Text"),
+            "User": {
+                "Name": user.get("_refObjectName") or user.get("Name"),
+                "_ref": user.get("_ref"),
+            } if isinstance(user, dict) else None,
+            "CreationDate": p.get("CreationDate"),
+            "ObjectID": p.get("ObjectID"),
+            "_ref": p.get("_ref"),
+        })
+    # Rally returns posts newest-first; reverse so Claude reads the
+    # conversation in chronological order.
+    out.reverse()
+    return out
+
+
 def cmd_get(args: argparse.Namespace) -> None:
     cfg = load_config()
     key = require_key(cfg)
@@ -293,7 +459,15 @@ def cmd_get(args: argparse.Namespace) -> None:
     results = qr.get("Results", [])
     if not results:
         die("not_found", f"No {artifact} with FormattedID '{fid}'")
-    print(json.dumps(slim(results[0]) if not args.full else results[0], indent=2))
+    raw = results[0]
+    item = raw if args.full else slim(raw)
+    # Always pull comments — they carry tester/dev conversation, blockers,
+    # verification status, prior context. Fetching is one extra HTTP call
+    # only when Discussion.Count > 0.
+    comments = fetch_comments(cfg, key, raw)
+    if comments or (isinstance(raw.get("Discussion"), dict) and raw["Discussion"].get("Count", 0) > 0):
+        item["Comments"] = comments
+    print(json.dumps(item, indent=2))
 
 
 # Terminal/done states by artifact type. Tenants can rename workflow states,
@@ -364,12 +538,51 @@ def cmd_children(args: argparse.Namespace) -> None:
         die("not_found", f"No {artifact} with FormattedID '{fid}'")
     parent = results[0]
 
+    matching_tag_oids: set[int] | None = None
+    if args.tag or args.tag_color:
+        tag_index = fetch_tag_index(cfg, key)
+        matching = resolve_tag_filter(tag_index, args.tag, args.tag_color)
+        if not matching:
+            available_families = sorted({t.get("ColorFamily") for t in tag_index.values() if t.get("ColorFamily")})
+            die("no_tags_match",
+                f"No tags matched tag={args.tag!r} tag_color={args.tag_color!r}",
+                available_color_families=available_families)
+        matching_tag_oids = {t["ObjectID"] for t in matching}
+
+    color_target_hex: str | None = None
+    color_target_family: str | None = None
+    if args.color:
+        raw = args.color.strip()
+        if raw.startswith("#") or (len(raw) == 6 and all(c in "0123456789abcdefABCDEF" for c in raw)):
+            color_target_hex = (raw if raw.startswith("#") else f"#{raw}").lower()
+        else:
+            color_target_family = raw.lower()
+
+    def _matches_color(kid: dict) -> bool:
+        dc = (kid.get("DisplayColor") or "").lower()
+        if color_target_hex:
+            return dc == color_target_hex
+        if color_target_family:
+            return color_family(dc) == color_target_family
+        return True
+
     buckets: dict[str, list] = {}
     closed_filtered = 0
+    tag_filtered = 0
+    color_filtered = 0
     for rel in ("Tasks", "Defects", "Children", "UserStories"):
         ref = parent.get(rel)
         if isinstance(ref, dict) and ref.get("Count", 0) > 0 and ref.get("_ref"):
-            kids = [slim(r) for r in fetch_collection(cfg, key, ref["_ref"])]
+            raw_kids = fetch_collection(cfg, key, ref["_ref"])
+            if matching_tag_oids is not None:
+                before = len(raw_kids)
+                raw_kids = [k for k in raw_kids if artifact_tag_oids(k) & matching_tag_oids]
+                tag_filtered += before - len(raw_kids)
+            if args.color:
+                before = len(raw_kids)
+                raw_kids = [k for k in raw_kids if _matches_color(k)]
+                color_filtered += before - len(raw_kids)
+            kids = [slim(r) for r in raw_kids]
             if not args.include_closed:
                 before = len(kids)
                 kids = [k for k in kids if not _is_closed(k)]
@@ -379,7 +592,11 @@ def cmd_children(args: argparse.Namespace) -> None:
         "parent": slim(parent),
         "children": buckets,
         "closed_filtered": closed_filtered,
+        "tag_filtered": tag_filtered,
+        "color_filtered": color_filtered,
         "include_closed": bool(args.include_closed),
+        "tag_filter": {"tag": args.tag, "tag_color": args.tag_color} if (args.tag or args.tag_color) else None,
+        "color_filter": args.color,
     }, indent=2))
 
 
@@ -450,22 +667,27 @@ def _download_inline_image(cfg: dict, key: str, ref_path: str) -> bytes:
     return b""
 
 
-def _extract_inline_image_refs(parent: dict) -> list[dict]:
-    """Pull /slm/attachment/<oid>/<filename> refs out of HTML body fields."""
+def _extract_inline_image_refs(parent: dict, comments: list[dict] | None = None) -> list[dict]:
+    """Pull /slm/attachment/<oid>/<filename> refs out of HTML body fields and comments."""
     pattern = re.compile(r'/slm/attachment/(\d+)/([^"\'<>\s]+)')
     seen: set[str] = set()
     refs: list[dict] = []
-    for field in HTML_FIELDS_WITH_IMAGES:
-        body = parent.get(field)
-        if not isinstance(body, str) or not body:
-            continue
-        for m in pattern.finditer(body):
+
+    def _scan(text: str | None, source: str) -> None:
+        if not isinstance(text, str) or not text:
+            return
+        for m in pattern.finditer(text):
             oid, name = m.group(1), m.group(2)
             ref_path = m.group(0)
             if ref_path in seen:
                 continue
             seen.add(ref_path)
-            refs.append({"ObjectID": int(oid), "Name": name, "Source": field, "RefPath": ref_path})
+            refs.append({"ObjectID": int(oid), "Name": name, "Source": source, "RefPath": ref_path})
+
+    for field in HTML_FIELDS_WITH_IMAGES:
+        _scan(parent.get(field), field)
+    for i, post in enumerate(comments or []):
+        _scan(post.get("Text"), f"comment[{i}]")
     return refs
 
 
@@ -481,7 +703,7 @@ def cmd_attachments(args: argparse.Namespace) -> None:
     key = require_key(cfg)
     fid = args.formatted_id.strip().upper()
     artifact = artifact_type_for_formatted_id(fid)
-    fetch_fields = ",".join(["FormattedID", "Name", "Attachments", *HTML_FIELDS_WITH_IMAGES])
+    fetch_fields = ",".join(["FormattedID", "Name", "Attachments", "Discussion", *HTML_FIELDS_WITH_IMAGES])
     url = query_url(cfg, artifact, query=f'(FormattedID = "{fid}")', fetch=fetch_fields, pagesize=2)
     qr = unwrap_query(http_get(url, key))
     results = qr.get("Results", [])
@@ -502,7 +724,10 @@ def cmd_attachments(args: argparse.Namespace) -> None:
                 "_content_ref": (att.get("Content") or {}).get("_ref"),
             })
 
-    inline_refs = _extract_inline_image_refs(parent)
+    # Scan inline image refs in body fields AND in comment text — testers
+    # often paste verification screenshots into Discussion.
+    comments = fetch_comments(cfg, key, parent)
+    inline_refs = _extract_inline_image_refs(parent, comments=comments)
     # Avoid duplicates: inline refs whose OID also appears in Attachments
     attached_oids = {it["ObjectID"] for it in items if it.get("ObjectID")}
     for ref in inline_refs:
@@ -548,6 +773,32 @@ def cmd_attachments(args: argparse.Namespace) -> None:
     }, indent=2))
 
 
+def cmd_tags(args: argparse.Namespace) -> None:
+    """List all tags visible to the key, optionally filtered by color family."""
+    cfg = load_config()
+    key = require_key(cfg)
+    index = fetch_tag_index(cfg, key)
+    rows = list(index.values())
+    if args.color:
+        target = args.color.strip().lower().lstrip("#")
+        if len(target) == 6 and all(c in "0123456789abcdef" for c in target):
+            rows = [t for t in rows if (t.get("Color") or "").lower().lstrip("#") == target]
+        else:
+            rows = [t for t in rows if (t.get("ColorFamily") or "") == target]
+    rows.sort(key=lambda t: ((t.get("ColorFamily") or "zzz"), (t.get("Name") or "")))
+    # Group by color family so the user can scan visually
+    by_family: dict[str, list[dict]] = {}
+    for t in rows:
+        fam = t.get("ColorFamily") or "uncategorized"
+        by_family.setdefault(fam, []).append(
+            {"Name": t.get("Name"), "Color": t.get("Color"), "ObjectID": t.get("ObjectID")}
+        )
+    print(json.dumps({
+        "total": len(rows),
+        "by_color_family": by_family,
+    }, indent=2))
+
+
 def cmd_list(args: argparse.Namespace) -> None:
     cfg = load_config()
     key = require_key(cfg)
@@ -574,6 +825,31 @@ def cmd_list(args: argparse.Namespace) -> None:
         clauses.append(f'(Name contains "{args.name_contains}")')
     if args.iteration:
         clauses.append(f'(Iteration.Name = "{args.iteration}")')
+    if args.tag or args.tag_color:
+        tag_index = fetch_tag_index(cfg, key)
+        matching = resolve_tag_filter(tag_index, args.tag, args.tag_color)
+        if not matching:
+            available_families = sorted({t.get("ColorFamily") for t in tag_index.values() if t.get("ColorFamily")})
+            available_names = sorted({t.get("Name") for t in tag_index.values() if t.get("Name")})[:30]
+            die("no_tags_match",
+                f"No tags matched tag={args.tag!r} tag_color={args.tag_color!r}",
+                available_color_families=available_families,
+                sample_tag_names=available_names)
+        clause = _refs_or_clause([t["_ref"] for t in matching], field="Tags")
+        if clause:
+            clauses.append(clause)
+
+    # --color filters by the artifact's own DisplayColor. Hex is filtered at
+    # the API; a family name (purple, red, blue) is post-filtered Python-side
+    # because Rally Query Language can't do "hex hue ~= purple".
+    color_post_filter: str | None = None
+    if args.color:
+        raw = args.color.strip()
+        if raw.startswith("#") or (len(raw) == 6 and all(c in "0123456789abcdefABCDEF" for c in raw)):
+            target_hex = raw if raw.startswith("#") else f"#{raw}"
+            clauses.append(f'(DisplayColor = "{target_hex}")')
+        else:
+            color_post_filter = raw.lower()
 
     # Hide closed/accepted items unless the user explicitly opted in or
     # already filtered by state. The skill-level rationale: most queries are
@@ -595,11 +871,22 @@ def cmd_list(args: argparse.Namespace) -> None:
                     pagesize=args.pagesize, start=args.start,
                     order=args.order or "FormattedID", project=project_ref)
     qr = unwrap_query(http_get(url, key))
-    items = [slim(r) for r in qr.get("Results", [])]
+    raw_items = qr.get("Results", [])
+    color_filtered = 0
+    if color_post_filter:
+        before = len(raw_items)
+        raw_items = [
+            r for r in raw_items
+            if color_family(r.get("DisplayColor") or "") == color_post_filter
+        ]
+        color_filtered = before - len(raw_items)
+    items = [slim(r) for r in raw_items]
     print(json.dumps({
         "total": qr.get("TotalResultCount"),
         "start": qr.get("StartIndex"),
         "pagesize": qr.get("PageSize"),
+        "color_filter": args.color,
+        "color_filtered_in_page": color_filtered,
         "items": items,
     }, indent=2))
 
@@ -631,7 +918,14 @@ def build_parser() -> argparse.ArgumentParser:
     pch.add_argument("formatted_id")
     pch.add_argument("--include-closed", action="store_true",
                      help="Include closed/accepted/completed children (filtered out by default)")
+    pch.add_argument("--tag", help="Only include children with this exact tag name")
+    pch.add_argument("--tag-color", help="Only include children with a TAG in this color family (rare — most tenants don't color tags)")
+    pch.add_argument("--color", help="Only include children whose DisplayColor matches this color family (purple, red, blue…) or hex (#4a1d7e)")
     pch.set_defaults(func=cmd_children)
+
+    ptg = sub.add_parser("tags", help="List tags visible to the user, grouped by color family")
+    ptg.add_argument("--color", help="Filter to a single color family or hex code")
+    ptg.set_defaults(func=cmd_tags)
 
     pt = sub.add_parser("tree", help="Recursive children to a bounded depth")
     pt.add_argument("formatted_id")
@@ -654,6 +948,9 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--owner", help="'me' or a UserName (e.g. alice@example.com)")
     pl.add_argument("--iteration", help="Exact iteration Name")
     pl.add_argument("--name-contains", help="Substring match on Name")
+    pl.add_argument("--tag", help="Only include items with this exact tag name")
+    pl.add_argument("--tag-color", help="Only include items with a TAG in this color family (rare — most tenants don't color tags)")
+    pl.add_argument("--color", help="Only include items whose DisplayColor matches this color family (purple, red, blue…) or hex (#4a1d7e)")
     pl.add_argument("--order", default=None, help="e.g. 'LastUpdateDate DESC'")
     pl.add_argument("--pagesize", type=int, default=50)
     pl.add_argument("--start", type=int, default=1)

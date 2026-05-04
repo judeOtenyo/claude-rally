@@ -63,10 +63,35 @@ All commands emit JSON on stdout. Errors emit `{"error": {"code": "...", "messag
 | `scripts/rally.py get <FID>` | Fetches one artifact (US/DE/TA/DS/TC/F/I/E); `--full` for all fields |
 | `scripts/rally.py children <FID>` | Immediate children — Tasks, Defects, Children, UserStories |
 | `scripts/rally.py tree <FID> [--depth N]` | Recursive children, default depth 2 |
-| `scripts/rally.py attachments <FID> [--download] [--dir PATH]` | List attachments + inline images; `--download` saves them to `/tmp/rally-attachments/<FID>/` |
+| `scripts/rally.py attachments <FID> [--download] [--dir PATH]` | List attachments + inline images (incl. images embedded in comments); `--download` saves them to `/tmp/rally-attachments/<FID>/` |
+| `scripts/rally.py tags [--color FAMILY]` | List all tags, grouped by color family |
 | `scripts/rally.py list --type US --project "Foo" --owner me --state In-Progress` | Query with filters |
+| `scripts/rally.py list --type DE --color purple` | Filter by `DisplayColor` family (purple, red, blue, …) or hex (`#4a1d7e`) |
+| `scripts/rally.py children DS22 --color purple` | Same color filter on a defect-suite drill-down |
 
 Artifact type prefixes: `US` user story, `DE` defect, `TA` task, `DS` defect suite, `TC` test case, `F`/`I`/`E` portfolio items (feature / initiative / epic). The script picks the right endpoint from the prefix.
+
+### Comments are always loaded — and they matter
+
+`get <FID>` automatically expands the artifact's `Discussion` collection into a `Comments` array. **Always read these before doing anything else.** Comments are where the team actually communicates: testers say whether your fix worked, devs explain why something is blocked, prior triage notes show what's been tried, and rejected fixes leave a paper trail. Skipping them means you're working on stale information.
+
+Treat comments as primary context — same priority as `c_ActualResults`. If a comment says "fixed in PR #123, please verify" or "still reproing on Sprint 9 build", that changes the entire shape of your task.
+
+Each comment has `Text` (HTML), `User`, and `CreationDate`. They come back chronologically (oldest first). The `Text` field often embeds screenshots — `attachments <FID> --download` scans comment HTML for `/slm/attachment/...` refs and pulls those images down too, so you can Read them alongside the body-field screenshots.
+
+### Filtering by color — "show me the purple defects in DS22"
+
+Rally lets users flag artifacts with a `DisplayColor` (a small color square in the UI). Teams use this to mark severity, theme, owner cluster, or whatever convention the tenant has settled on. The script can filter by it.
+
+```bash
+scripts/rally.py list --type DE --color purple
+scripts/rally.py children DS22 --color purple
+scripts/rally.py list --type US --color "#4a1d7e"     # exact hex also works
+```
+
+Color family names map to hue ranges (red, orange, yellow, lime, green, cyan, sky, blue, purple, magenta, pink, plus gray/white/black for desaturated). When the user says "purple stuff", they mean the family — pass the name. When they paste a specific hex, pass the hex.
+
+`DisplayColor` is **different from tag colors.** Most tenants don't color their tags, so `--tag-color` is rarely useful. Reach for `--color` first; only fall back to `--tag-color` if the user explicitly says "the tag itself is colored." Tag *names* still work via `--tag NAME` and the `tags` command shows what exists.
 
 ### Closed items are hidden by default
 
